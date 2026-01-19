@@ -1,2 +1,5 @@
-schema:
-	npx get-graphql-schema https://graphql.mainnet.sui.io/graphql > schema.graphql
+query: sui_mainnet_introspection_query.graphql
+	./generate_sui_schema.sh
+
+types:
+	go run github.com/99designs/gqlgen generate
