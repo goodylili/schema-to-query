@@ -17,7 +17,6 @@ import type {
   GraphQLField,
   GraphQLType,
 } from 'graphql';
-import * as prettier from 'prettier';
 
 // A safe maximum depth to prevent OOM/StackOverflow on large schemas.
 // 3 is generally deep enough for almost all use cases while being safer than "infinite".
@@ -33,64 +32,123 @@ function getUnwrappedType(type: GraphQLType): GraphQLType {
   return type;
 }
 
-function generateFieldSelection(type: GraphQLType, maxDepth: number, visitedTypes: Set<string> = new Set(), depth: number = 0): string {
-  if (depth > maxDepth) {
-      return '';
-  }
+function hasValidSelection(type: GraphQLType, maxDepth: number, visitedTypes: Set<string>, depth: number): boolean {
+    if (depth > maxDepth) {
+        return false;
+    }
 
-  const unwrappedType = getUnwrappedType(type);
-  const typeName = 'name' in unwrappedType ? (unwrappedType as any).name : '';
+    const unwrappedType = getUnwrappedType(type);
 
-  if (typeName && visitedTypes.has(typeName)) {
-      return '';
-  }
+    if (isScalarType(unwrappedType)) {
+        // Scalars are "leaves" in the selection tree, but this function checks if we can *select* from them.
+        // Wait, if we are at a field F of type Scalar, we definitely include it.
+        // But the recursion calls hasValidSelection(fieldType).
+        // If fieldType is scalar, it means we found a leaf.
+        return true;
+    }
 
-  const newVisitedTypes = new Set(visitedTypes);
-  if (typeName) {
-      newVisitedTypes.add(typeName);
-  }
+    const typeName = 'name' in unwrappedType ? (unwrappedType as any).name : '';
+    if (typeName && visitedTypes.has(typeName)) {
+        return false;
+    }
 
-  if (isScalarType(unwrappedType)) {
-    return '';
-  }
+    const newVisitedTypes = new Set(visitedTypes);
+    if (typeName) {
+        newVisitedTypes.add(typeName);
+    }
 
-  if (isObjectType(unwrappedType) || isInterfaceType(unwrappedType)) {
-    const fields = unwrappedType.getFields();
-    const selection = Object.values(fields)
-      .map((field) => {
-        const fieldType = getUnwrappedType(field.type);
-        if (isScalarType(fieldType)) {
-            return field.name;
-        }
-        
-        const subSelection = generateFieldSelection(field.type, maxDepth, newVisitedTypes, depth + 1);
-        if (subSelection) {
-            return `${field.name} { ${subSelection} }`;
-        }
-        return null;
-      })
-      .filter(Boolean)
-      .join('\n');
-    
-    return selection;
-  }
-
-  if (isUnionType(unwrappedType)) {
-      const types = unwrappedType.getTypes();
-      const selection = types.map(t => {
-          const subSelection = generateFieldSelection(t, maxDepth, newVisitedTypes, depth + 1);
-           if (subSelection) {
-                return `... on ${t.name} { ${subSelection} }`;
+    if (isObjectType(unwrappedType) || isInterfaceType(unwrappedType)) {
+        const fields = unwrappedType.getFields();
+        for (const field of Object.values(fields)) {
+            const fieldType = getUnwrappedType(field.type);
+            if (isScalarType(fieldType)) {
+                return true;
             }
-            return null;
-      }).filter(Boolean).join('\n');
-      return selection;
-  }
+            if (hasValidSelection(field.type, maxDepth, newVisitedTypes, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
-  return '';
+    if (isUnionType(unwrappedType)) {
+        const types = unwrappedType.getTypes();
+        for (const t of types) {
+            if (hasValidSelection(t, maxDepth, newVisitedTypes, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    return false;
 }
 
-function generateOperation(operationType: 'query' | 'mutation', fieldName: string, field: GraphQLField<any, any>, maxDepth: number): string {
+async function writeFieldSelection(
+    stream: fs.WriteStream,
+    type: GraphQLType,
+    maxDepth: number,
+    visitedTypes: Set<string>,
+    depth: number,
+    indent: string
+): Promise<void> {
+    if (depth > maxDepth) {
+        return;
+    }
+
+    const unwrappedType = getUnwrappedType(type);
+    const typeName = 'name' in unwrappedType ? (unwrappedType as any).name : '';
+
+    if (typeName && visitedTypes.has(typeName)) {
+        return;
+    }
+
+    const newVisitedTypes = new Set(visitedTypes);
+    if (typeName) {
+        newVisitedTypes.add(typeName);
+    }
+
+    const write = async (chunk: string) => {
+        if (!stream.write(chunk)) {
+            await new Promise<void>((resolve) => stream.once('drain', resolve));
+        }
+    };
+
+    if (isObjectType(unwrappedType) || isInterfaceType(unwrappedType)) {
+        const fields = unwrappedType.getFields();
+        for (const field of Object.values(fields)) {
+            const fieldType = getUnwrappedType(field.type);
+            
+            if (isScalarType(fieldType)) {
+                await write(`${indent}${field.name}\n`);
+                continue;
+            }
+
+            if (hasValidSelection(field.type, maxDepth, newVisitedTypes, depth + 1)) {
+                await write(`${indent}${field.name} {\n`);
+                await writeFieldSelection(stream, field.type, maxDepth, newVisitedTypes, depth + 1, indent + '  ');
+                await write(`${indent}}\n`);
+            }
+        }
+    } else if (isUnionType(unwrappedType)) {
+        const types = unwrappedType.getTypes();
+        for (const t of types) {
+            if (hasValidSelection(t, maxDepth, newVisitedTypes, depth + 1)) {
+                await write(`${indent}... on ${t.name} {\n`);
+                await writeFieldSelection(stream, t, maxDepth, newVisitedTypes, depth + 1, indent + '  ');
+                await write(`${indent}}\n`);
+            }
+        }
+    }
+}
+
+async function writeOperation(
+    stream: fs.WriteStream,
+    operationType: 'query' | 'mutation',
+    fieldName: string,
+    field: GraphQLField<any, any>,
+    maxDepth: number
+): Promise<void> {
     const args = field.args;
     let queryName = `${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)}`;
     if (operationType === 'mutation') queryName = 'Mutate' + queryName;
@@ -98,30 +156,44 @@ function generateOperation(operationType: 'query' | 'mutation', fieldName: strin
 
     let varDefs = '';
     let argsUsage = '';
-    
+
     if (args.length > 0) {
         const vars = args.map(arg => {
-             const typeStr = arg.type.toString();
-             return `$${arg.name}: ${typeStr}`;
+            const typeStr = arg.type.toString();
+            return `$${arg.name}: ${typeStr}`;
         });
         varDefs = `(${vars.join(', ')})`;
-        
+
         const usages = args.map(arg => {
             return `${arg.name}: $${arg.name}`;
         });
         argsUsage = `(${usages.join(', ')})`;
     }
 
-    const selection = generateFieldSelection(field.type, maxDepth);
-    
-    let op = `${operationType} ${queryName}${varDefs} {
-        ${fieldName}${argsUsage} ${selection ? `{
-            ${selection}
-        }` : ''}
-    }`;
+    const write = async (chunk: string) => {
+        if (!stream.write(chunk)) {
+            await new Promise<void>((resolve) => stream.once('drain', resolve));
+        }
+    };
 
-    return op;
+    if (hasValidSelection(field.type, maxDepth, new Set(), 0)) {
+        await write(`${operationType} ${queryName}${varDefs} {\n`);
+        await write(`  ${fieldName}${argsUsage} {\n`);
+        await writeFieldSelection(stream, field.type, maxDepth, new Set(), 0, '    ');
+        await write(`  }\n`);
+        await write(`}\n\n`);
+    } else {
+        // Even if no selection (unlikely for root fields usually), we might want to print something or skip.
+        // If it returns scalar (unlikely for root query/mutation), we should print it.
+        const unwrapped = getUnwrappedType(field.type);
+        if (isScalarType(unwrapped)) {
+             await write(`${operationType} ${queryName}${varDefs} {\n`);
+             await write(`  ${fieldName}${argsUsage}\n`);
+             await write(`}\n\n`);
+        }
+    }
 }
+
 
 async function fetchSchema(endpoint: string): Promise<GraphQLSchema> {
     console.log(`Fetching schema from ${endpoint}...`);
@@ -157,43 +229,43 @@ export async function generate(endpoint: string, outputPath: string, maxDepth: n
     const effectiveMaxDepth = maxDepth === 0 ? 100 : maxDepth;
 
     try {
-    const schema = await fetchSchema(endpoint);
+        const schema = await fetchSchema(endpoint);
 
-    const queryType = schema.getQueryType();
-    const mutationType = schema.getMutationType();
+        const queryType = schema.getQueryType();
+        const mutationType = schema.getMutationType();
 
-    let output = '';
+        const stream = fs.createWriteStream(outputPath);
+        
+        // Helper to handle backpressure is now inside writeOperation/writeFieldSelection or we can reuse it if we pass it.
+        // But writeOperation takes stream and handles writes internally.
 
-    if (queryType) {
-      const fields = queryType.getFields();
-      for (const [fieldName, field] of Object.entries(fields)) {
-        output += generateOperation('query', fieldName, field, effectiveMaxDepth) + '\n\n';
-      }
+        if (queryType) {
+            const fields = queryType.getFields();
+            for (const [fieldName, field] of Object.entries(fields)) {
+                await writeOperation(stream, 'query', fieldName, field, effectiveMaxDepth);
+            }
+        }
+
+        if (mutationType) {
+            const fields = mutationType.getFields();
+            for (const [fieldName, field] of Object.entries(fields)) {
+                await writeOperation(stream, 'mutation', fieldName, field, effectiveMaxDepth);
+            }
+        }
+
+        stream.end();
+
+        await new Promise<void>((resolve, reject) => {
+            stream.on('finish', resolve);
+            stream.on('error', reject);
+        });
+        
+        console.log(`Generated queries at ${outputPath}`);
+    } catch (error: any) {
+        // Re-throw specific errors for the caller to handle
+        if (error instanceof RangeError || error.message?.includes('Invalid string length')) {
+            throw new Error('OUTPUT_TOO_LARGE');
+        }
+        throw error;
     }
-
-    if (mutationType) {
-      const fields = mutationType.getFields();
-      for (const [fieldName, field] of Object.entries(fields)) {
-          output += generateOperation('mutation', fieldName, field, effectiveMaxDepth) + '\n\n';
-      }
-    }
-
-    console.log('Formatting output...');
-    // If the file is massive, Prettier might crash. We can try/catch this too.
-    try {
-        const formatted = await prettier.format(output, { parser: 'graphql' });
-        fs.writeFileSync(outputPath, formatted);
-    } catch (prettierError) {
-        console.warn('Warning: Output too large for Prettier. Writing raw output...');
-        fs.writeFileSync(outputPath, output);
-    }
-    
-    console.log(`Generated queries at ${outputPath}`);
-  } catch (error: any) {
-    // Re-throw specific errors for the caller to handle
-    if (error instanceof RangeError || error.message?.includes('Invalid string length')) {
-        throw new Error('OUTPUT_TOO_LARGE');
-    }
-    throw error;
-  }
 }
