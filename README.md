@@ -8,7 +8,7 @@ It automatically generates selection sets for objects, interfaces, and unions (u
 
 - **Zero Config**: Just provide the endpoint URL.
 - **Complete Coverage**: Generates operations for every Query and Mutation field defined in the schema.
-- **Smart Selection**: Recursively builds selection sets for Objects and Interfaces (safe depth of 7, avoiding cycles).
+- **Smart Selection**: Recursively builds selection sets for Objects and Interfaces (configurable depth, default 7, avoiding cycles).
 - **Union Support**: Automatically generates inline fragments for Union types.
 - **Prettified**: Output is automatically formatted using Prettier.
 - **Flexible Output**: Defaults to `query.graphql`, or specify your own output path.
@@ -20,14 +20,19 @@ It automatically generates selection sets for objects, interfaces, and unions (u
 You don't need to install anything. Just run:
 
 ```bash
-npx schema-to-query <graphql-endpoint-url> [output-file]
+npx schema-to-query <graphql-endpoint-url> [output-file] [--depth <number>]
 ```
 
 **Examples:**
 
-Generate `query.graphql` in the current directory:
+Generate `query.graphql` in the current directory (default depth 7):
 ```bash
 npx schema-to-query https://graphql.mainnet.sui.io/graphql
+```
+
+Generate with a custom depth of 10:
+```bash
+npx schema-to-query https://graphql.mainnet.sui.io/graphql --depth 10
 ```
 
 Generate to a specific file:

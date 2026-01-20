@@ -21,7 +21,7 @@ import * as prettier from 'prettier';
 
 // A safe maximum depth to prevent OOM/StackOverflow on large schemas.
 // 7 is generally deep enough for almost all use cases while being safer than "infinite".
-const MAX_SAFE_DEPTH = 7;
+const DEFAULT_MAX_DEPTH = 7;
 
 function getUnwrappedType(type: GraphQLType): GraphQLType {
   if (isNonNullType(type)) {
@@ -33,8 +33,8 @@ function getUnwrappedType(type: GraphQLType): GraphQLType {
   return type;
 }
 
-function generateFieldSelection(type: GraphQLType, visitedTypes: Set<string> = new Set(), depth: number = 0): string {
-  if (depth > MAX_SAFE_DEPTH) {
+function generateFieldSelection(type: GraphQLType, maxDepth: number, visitedTypes: Set<string> = new Set(), depth: number = 0): string {
+  if (depth > maxDepth) {
       return '';
   }
 
@@ -63,7 +63,7 @@ function generateFieldSelection(type: GraphQLType, visitedTypes: Set<string> = n
             return field.name;
         }
         
-        const subSelection = generateFieldSelection(field.type, newVisitedTypes, depth + 1);
+        const subSelection = generateFieldSelection(field.type, maxDepth, newVisitedTypes, depth + 1);
         if (subSelection) {
             return `${field.name} { ${subSelection} }`;
         }
@@ -78,7 +78,7 @@ function generateFieldSelection(type: GraphQLType, visitedTypes: Set<string> = n
   if (isUnionType(unwrappedType)) {
       const types = unwrappedType.getTypes();
       const selection = types.map(t => {
-          const subSelection = generateFieldSelection(t, newVisitedTypes, depth + 1);
+          const subSelection = generateFieldSelection(t, maxDepth, newVisitedTypes, depth + 1);
            if (subSelection) {
                 return `... on ${t.name} { ${subSelection} }`;
             }
@@ -90,7 +90,7 @@ function generateFieldSelection(type: GraphQLType, visitedTypes: Set<string> = n
   return '';
 }
 
-function generateOperation(operationType: 'query' | 'mutation', fieldName: string, field: GraphQLField<any, any>): string {
+function generateOperation(operationType: 'query' | 'mutation', fieldName: string, field: GraphQLField<any, any>, maxDepth: number): string {
     const args = field.args;
     let queryName = `${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)}`;
     if (operationType === 'mutation') queryName = 'Mutate' + queryName;
@@ -112,7 +112,7 @@ function generateOperation(operationType: 'query' | 'mutation', fieldName: strin
         argsUsage = `(${usages.join(', ')})`;
     }
 
-    const selection = generateFieldSelection(field.type);
+    const selection = generateFieldSelection(field.type, maxDepth);
     
     let op = `${operationType} ${queryName}${varDefs} {
         ${fieldName}${argsUsage} ${selection ? `{
@@ -150,7 +150,7 @@ async function fetchSchema(endpoint: string): Promise<GraphQLSchema> {
     return buildClientSchema(introspectionData as IntrospectionQuery);
 }
 
-export async function generate(endpoint: string, outputPath: string) {
+export async function generate(endpoint: string, outputPath: string, maxDepth: number = DEFAULT_MAX_DEPTH) {
   try {
     const schema = await fetchSchema(endpoint);
 
@@ -162,14 +162,14 @@ export async function generate(endpoint: string, outputPath: string) {
     if (queryType) {
       const fields = queryType.getFields();
       for (const [fieldName, field] of Object.entries(fields)) {
-        output += generateOperation('query', fieldName, field) + '\n\n';
+        output += generateOperation('query', fieldName, field, maxDepth) + '\n\n';
       }
     }
 
     if (mutationType) {
       const fields = mutationType.getFields();
       for (const [fieldName, field] of Object.entries(fields)) {
-          output += generateOperation('mutation', fieldName, field) + '\n\n';
+          output += generateOperation('mutation', fieldName, field, maxDepth) + '\n\n';
       }
     }
 
